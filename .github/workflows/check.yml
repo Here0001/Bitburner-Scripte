@@ -1,0 +1,43 @@
+# Automatic checks for every pull request and every push to main.
+# Free on public repositories. Mirrors stages 1 and 3 of the author's local
+# deploy tool: the static checker (PRUEFER) and a syntax check of every script
+# AND of every daemon embedded as a template string (payloads) - a typo inside
+# a payload parses fine from the outside and only fails when the Queen writes
+# the daemon to disk in the game.
+name: check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: PRUEFER (static checks - version headers, payload rules, ports, registry, RPC names)
+        run: perl tools/SCHWARM-PRUEFER.pl scripts -kurz
+
+      - name: Syntax of every script (ES modules)
+        run: |
+          fehler=0
+          for f in scripts/*.js schwarm-install.js; do
+            if ! node --input-type=module --check < "$f"; then
+              echo "::error file=$f::syntax error"
+              fehler=1
+            fi
+          done
+          exit $fehler
+
+      - name: Syntax of every embedded payload daemon
+        run: node tools/nutzlast-check.mjs scripts/SCHWARM-PAYLOADS.js scripts/SCHWARM-DARKNET.js scripts/SCHWARM-GENESIS.js

@@ -1,5 +1,7 @@
 # SCHWARM — a self-driving script suite for Bitburner
 
+[![check](https://github.com/Here0001/Bitburner-Scripte/actions/workflows/check.yml/badge.svg)](https://github.com/Here0001/Bitburner-Scripte/actions/workflows/check.yml)
+
 **SCHWARM** (German for *swarm*) plays [Bitburner](https://github.com/bitburner-official/bitburner-src) largely by itself.
 It roots and hacks the whole network, manages your money, buys and installs augmentations, and runs gangs,
 corporations, Bladeburner, the stock market, the Darknet, IPvGO and Stanek's Gift. It can also end a BitNode for
@@ -55,6 +57,12 @@ Things worth knowing before you start:
   file (how to allow ending a BitNode), DIAG reports, stopping and updating, and troubleshooting.
 - **[Script reference](docs/SCRIPTS.md)**: what every script and embedded daemon does, how to run it on its own,
   RAM, requirements, and how to switch it on or off.
+
+## Checks
+
+Every pull request and every push to `main` runs [automatic checks](.github/workflows/check.yml): a static checker
+(`tools/SCHWARM-PRUEFER.pl`: version headers, payload rules, port table, daemon registry, RPC names) and a syntax
+check of every script and of every daemon embedded as a template string (`tools/nutzlast-check.mjs`).
 
 ## Credits
 
