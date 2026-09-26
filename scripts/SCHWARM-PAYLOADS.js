@@ -2734,7 +2734,7 @@ function myValidMatrix(board, history) {
 // (GO bleibt standalone): Nachrichtenformat inline, identisch zu
 // HELPERS.requestInfoAction / readInfoActionResult.
 // v0.7: vorher 29/30 hartcodiert - 29 ist AKTIV_OUT, 30 schreibt niemand.
-const INFO_RPC_REQ = SCHWARM_PORTS.INFO_IN, INFO_RPC_RES = SCHWARM_PORTS.INFO_RPC_RES, INFO_EMPTY_PORT = "NULL PORT DATA";
+const INFO_RPC_REQ = SCHWARM_PORTS.INFO_IN,, INFO_RPC_RES = SCHWARM_PORTS.INFO_RPC_RES, INFO_EMPTY_PORT = "NULL PORT DATA";
 
 /**
  * Führt einen ns-Ausdruck über INFOs eval-RPC aus und wartet auf das Ergebnis.
