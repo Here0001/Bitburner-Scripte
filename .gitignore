@@ -1,0 +1,9 @@
+# Game output and local notes - never part of the repository
+*.log
+*.bak
+*.tmp
+*.txt
+!schwarm-plan.txt
+node_modules/
+.DS_Store
+Thumbs.db

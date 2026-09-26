@@ -1,0 +1,34 @@
+# =============================================================================
+# schwarm-plan.txt - your strategy for SCHWARM (example)
+# =============================================================================
+# The swarm only READS this file and never writes to it. The Queen re-reads it
+# every 2 seconds, so edits in the game (nano schwarm-plan.txt) apply at once.
+#
+# Format: lines "KEY: value". Everything after # is a comment. Unknown keys are
+# ignored. The keys are German on purpose - the scripts look for these words.
+#
+# This example NEVER ends a BitNode (BEENDEN: nein). See docs/GUIDE.md,
+# section "The plan file", before you change that.
+# =============================================================================
+
+# The BitNode you are playing right now. Only used for a sanity check: if it
+# does not match, the Queen logs "PLAN: ABWEICHUNG" (deviation).
+SOLL-NODE: 1
+
+# The BitNode to enter next when this one ends (1-15).
+ZIEL-NODE: 1
+
+# Approval to END the current BitNode: "ja" (yes) or "nein" (no).
+# Only the exact word "ja" counts. You also need the BITNODE button switched on.
+BEENDEN: nein
+
+# The approval only counts for this BitNode number. After moving on, an old
+# approval stops working by itself. Set it to your current BitNode together
+# with BEENDEN: ja.
+GILT-FUER-NODE: 0
+
+# How the run ends:
+#   daedalus    finish the Bladeburner black op "Operation Daedalus"
+#   weltdaemon  hack the world daemon w0r1d_d43m0n (needs The Red Pill)
+#   flume       side exit b1tflum3 - gives NO Source-File
+WEG: daedalus
