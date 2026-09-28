@@ -1,5 +1,16 @@
 /**
- * SCHWARM-CORP.js — v0.48
+ * SCHWARM-CORP.js — v0.49
+ *
+ * v0.49 — WAS CORP ANLEGT, STEHT IM HANDLUNGSBUCH (Punkt 24).
+ *   Divisionsgruendung, Stadtkauf und Aktien-Emission liefen nur ueber
+ *   ns.print - das Tail ist mit dem Prozess weg. Am 26.09. entstand so
+ *   Chemical in BN15, ohne dass sich spaeter belegen liess, wer es angelegt
+ *   hatte. Die Betraege kommen aus der CORP-Kasse, nicht vom Spieler -
+ *   deshalb ohne topf, mit kasse "corp". Dazu: `dran` im CORP_OUT (die
+ *   Division, die diese Runde ausgebaut wurde - DIAG braucht es fuer die
+ *   Lager-Regel), und zwei Kommentare, die noch das Tor von v0.39 nannten.
+ *   Nachtrag 1: die Kosten einer Division sind der Engine-Preis
+ *   (startingCost), nicht die Fondsdifferenz ueber mehrere evalNs.
  *
  * v0.48 — FRUEHER BOERSENGANG STATT HENNE-EI-FALLE.
  *   Beobachtet: 1 Division, 4/6 Staedte, privat, Runde 0/2, $774 Mio.
@@ -564,7 +575,7 @@ import { evalNs, formatMoney, publishHashNeed, publishCorpInfo, readBankInfo, re
 // waehrend der Kopf laengst auf 0.34 stand — genau die Drift, die der
 // PRUEFER bei allen anderen Dateien abfaengt (Kopf gegen Konstante). CORP
 // hatte als einzige gar keine Konstante und fiel deshalb durch das Raster.
-const VERSION = "0.48";
+const VERSION = "0.49";
 const STATE_FILE = "schwarm-corp-state.txt";
 const LOOP_MS = 5000;
 const WAIT_CORP_MS = 30_000;   // v0.21: Takt der Warteschleife, solange keine Corp existiert
@@ -755,6 +766,9 @@ const STAGE_IDLE_FUNDS_MULT = 3;      // Notausgang: Fonds >= 3x Startkosten
 // nicht traegt. Die Dividende liest es: wer noch fuer Personal spart, erntet
 // nicht. Modulweit, weil beide Seiten in verschiedenen Funktionen sitzen.
 let bueroHungrig = false;
+// v0.49: die Division, die in dieser Runde dran war (Reihum). Geht mit
+// CORP_OUT hinaus und wird danach geleert - eine Runde ohne Reihum meldet null.
+let zuletztDran = null;
 // v0.43: dasselbe fuers LAGER. Dass es fehlte, war der Grund, warum der Mangel
 // unsichtbar blieb - ein uebersprungener Lagerkauf hinterliess keine Spur.
 let lagerHungrig = false;
@@ -1362,6 +1376,22 @@ async function createDivision(ns, ind, name) {
     await evalNs(ns, `ns.corporation.expandIndustry(${JSON.stringify(ind)}, ${JSON.stringify(name)})`);
     const snap = await corpSnapshot(ns);
     const ok = !!(snap && snap.divisions.includes(name));
+    // v0.49: ins Handlungsbuch - bezahlt aus der Corp-Kasse, nicht vom Spieler.
+    // Nachtrag 1: der Engine-Preis (Actions.ts:80-86 zieht genau startingCost
+    // ab). Die Fondsdifferenz enthielt auch Umsatz, Smart Supply und BANKs
+    // Hash-Zufluss zwischen den beiden Abfragen.
+    let kosten = 0;
+    if (ok) {
+        try {
+            const idat = await industryData(ns, ind);
+            if (idat && typeof idat.startingCost === "number" && idat.startingCost >= 0) kosten = idat.startingCost;
+        } catch (e) { kosten = 0; }
+    }
+    try {
+        chronik(ns, "CORP", "division", `${name} (${ind})`, ok ? "gegruendet" : "fehlgeschlagen",
+            ok ? `${formatMoney(kosten)} aus der Corp-Kasse` : "",
+            { kasse: "corp", kosten: ok ? kosten : 0 });
+    } catch (e) { /* Beiwerk */ }
     // Die neue Division sofort in den Cache, damit die naechste Landkarte sie
     // kennt, ohne ein weiteres eval zu brauchen.
     if (ok) industrieCache.set(name, ind);
@@ -2046,6 +2076,11 @@ async function ensureCities(ns, div, budget, consts) {
         await cPurchaseWarehouse(ns, div, city);
         const ok = await cHasWarehouse(ns, div, city);
         budget.remaining -= need;
+        // v0.49: ins Handlungsbuch (Corp-Kasse).
+        try {
+            chronik(ns, "CORP", "stadt", `${div}/${city}`, ok ? "gekauft" : "unklar",
+                `Buero+Lager ${formatMoney(need)}`, { kasse: "corp", kosten: need });
+        } catch (e) { /* Beiwerk */ }
         ns.print(`  [${div}] Neue Stadt: ${city} (Büro+Lager, ${formatMoney(need)}) ${ok ? "OK" : "(Lager prüfen)"} — noch ${missing.length - 1} offen.`);
         return await divisionCities(ns, div);
     }
@@ -2744,6 +2779,10 @@ async function fensterStep(ns, snap, bueroUndLager) {
         if (max >= 10e6) {
             const r = await evalNs(ns, `(() => { try { return ns.corporation.issueNewShares(${max}); } catch (e) { return null; } })()`);
             if (typeof r === "number") {
+                try {
+                    chronik(ns, "CORP", "emission", "Aktien", "ausgegeben",
+                        `${fmtNum(max)} Aktien -> ${formatMoney(r)} (Fenster)`, { kasse: "corp", n: max, erloes: r });
+                } catch (e) { /* Beiwerk */ }
                 ns.print(`  [Fenster] Emission zum HOHEN Kurs: ${fmtNum(max)} Aktien -> `
                     + `${formatMoney(r)} Corp-Kapital. Jetzt ausgeben, bis die Fonds unter `
                     + `${formatMoney(grenze)} liegen.`);
@@ -2944,7 +2983,13 @@ async function stockStep(ns, snap, offer, reserve, stufeOffen) {
         let amount = Math.floor((snap.totalShares * ISSUE_FRACTION_OF_TOTAL) / 10e6) * 10e6;
         if (amount >= 10e6) {
             const r = await evalNs(ns, `(() => { try { return ns.corporation.issueNewShares(${amount}); } catch (e) { return null; } })()`);
-            if (typeof r === "number") ns.print(`  [Boerse] Emission: ${fmtNum(amount)} Aktien -> ${formatMoney(r)} Corp-Kapital (alles rueckkaufbar).`);
+            if (typeof r === "number") {
+                try {
+                    chronik(ns, "CORP", "emission", "Aktien", "ausgegeben",
+                        `${fmtNum(amount)} Aktien -> ${formatMoney(r)} (Reserve)`, { kasse: "corp", n: amount, erloes: r });
+                } catch (e) { /* Beiwerk */ }
+                ns.print(`  [Boerse] Emission: ${fmtNum(amount)} Aktien -> ${formatMoney(r)} Corp-Kapital (alles rueckkaufbar).`);
+            }
         }
     }
 
@@ -3410,9 +3455,10 @@ export async function main(ns) {
                 const unlocks = ensured.status;
                 const unlockReserve = ensured.reserve;
 
-                // --- 1b) NAECHSTE STUFE der Kette (Chem/Tabak). Bedingung: Vorstufe
-                //     existiert mit >= 3 Staedten, und die Kosten sind OHNE Unlock-
-                //     Reserve und OHNE Betriebskapital gedeckt.
+                // --- 1b) NAECHSTE STUFE der Kette (Chem/Tabak). Bedingung (v0.40):
+                //     Vorstufe in ALLEN Staedten, Gewinn >= STAGE_MIN_PROFIT_SEC ODER
+                //     Fonds >= STAGE_IDLE_FUNDS_MULT x Startkosten, und die Kosten
+                //     OHNE Unlock-Reserve und OHNE Betriebskapital gedeckt.
                 if (state.bp && state.bp !== "ADOPT") {
                     const stages = BLUEPRINTS[state.bp].stages;
                     for (let si = 1; si < stages.length; si++) {
@@ -3712,6 +3758,7 @@ export async function main(ns) {
                     // ueberhaupt erst erreichbar.
                     const reihe = rangfolge(ownDivs, divSummen);
                     const dran = reihe.length ? [reihe[0]] : [];
+                    zuletztDran = dran.length ? dran[0] : null;   // v0.49: fuer DIAG
                     if (dran.length) {
                         const z = divSummen[dran[0]] || {};
                         const pro = (z.staedte > 0) ? Math.round((z.empMax || 0) / z.staedte) : 0;
@@ -3890,8 +3937,11 @@ export async function main(ns) {
                         divisions: (snap2.divisions || []).length,
                         cities: ownDivs.reduce((a, d) => a + ((citiesByDiv[d] || []).length), 0),
                         reserve,
-                        // v0.24: null = Kette vollstaendig (nichts mehr anzusparen).
+                        // v0.24: null = nichts anzusparen. Seit v0.40 heisst das
+                        // Kette vollstaendig ODER Reifetor zu (Staedte/Gewinn).
                         kriegskasse,
+                        // v0.49: wer diese Runde dran war (null = kein Reihum).
+                        dran: zuletztDran,
                         autoStufe: AUTO_NEUE_STUFE,
                         // v0.44: Stufe und naechster Preis je Corp-Upgrade.
                         // Bis hierher war NICHT feststellbar, ob je eines gekauft
@@ -3935,6 +3985,7 @@ export async function main(ns) {
                         // ausserhalb waere jeder Rueckkauf zum Hoechstkurs.
                         fenster,
                     });
+                    zuletztDran = null;          // v0.49: gilt nur fuer diese Runde
                 }
 
                 const own = snap2.totalShares > 0 ? (snap2.numShares / snap2.totalShares * 100) : 100;

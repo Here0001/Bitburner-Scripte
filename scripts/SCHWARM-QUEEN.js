@@ -1,5 +1,14 @@
 /**
- * SCHWARM-QUEEN.js — v7.16
+ * SCHWARM-QUEEN.js — v7.17
+ *
+ * v7.17 — CORP LAEUFT NUR, WENN ES EINE CORP GIBT. Nach dem Wechsel nach
+ *   BN11 (Testspiel 27.09.2026) stand der Schalter an, home war auf 128 GB
+ *   zurueckgesetzt, und die Queen hielt fuer ein CORP, das nur wartet, 5 GB
+ *   frei - bis BANK die $150b beisammen hat, koennen Stunden vergehen.
+ *   Muster wie BITNODE (v7.6): der Schalter ist die Absicht, die bestehende
+ *   Corp der Ausloeser (HELPERS corpBesteht). Kein Umschalten, also kein
+ *   Wettlauf mit BANKs START:CORP. Abschnitt 4c2 beendet ein schon laufendes
+ *   CORP, wenn sicher keine Corp besteht (Uebergang von v7.16, Handstart).
  *
  * v7.16 — NACH DER SELBST-ERNEUERUNG LIEF ALTER CODE WEITER.
  *   Jede Aenderung an PAYLOADS loest die Selbst-Erneuerung aus. Die neue
@@ -497,13 +506,13 @@
 // 04.09.2026 waren das getrennte Freitexte und liefen auseinander: der
 // Kopf sagte eine Version, die Startmeldung im Log eine andere. Beim
 // Nachstellen eines Fehlers behauptet das Log damit etwas Falsches.
-const VERSION = "7.16";
+const VERSION = "7.17";
 
 import {
     DAEMONS, PHASE,
     STATE_FILE, readManagedState, isDaemonEnabled, setDaemonEnabled, planFreigabe,
     writeOutField,
-    daemonBereit, bereitSpielerInfo,
+    daemonBereit, bereitSpielerInfo, corpBesteht,
     publishManagedState,
     PSERV_PREFIX,
     setPhase, getPhase, publishCapabilities, detectCapabilities,
@@ -902,6 +911,14 @@ function shouldRun(ns, key, caps, state) {
     // Faellt die Freigabe weg (Node gewechselt, Plan zurueckgesetzt, QUEEN tot),
     // beendet ihn Abschnitt 4c im selben Takt.
     if (key === "BITNODE") return !!planFreigabe(ns);
+
+    // v7.17 — CORP LAEUFT NUR, WENN ES EINE CORP GIBT (Spieler 27.09.2026:
+    // "corp auf on kostet ram?"). Dasselbe Muster wie BITNODE: der Schalter
+    // ist die Absicht, die bestehende Corp der Ausloeser. Gruenden ist BANKs
+    // Aufgabe; sobald die Corp steht, startet CORP im naechsten Takt. Ein schon
+    // laufendes CORP ohne Corp beendet Abschnitt 4c2. FORCIERT (2) greift
+    // weiter oben und startet trotzdem.
+    if (key === "CORP" && corpBesteht(ns) !== true) return false;
 
     if (d.owner === "QUEEN") return true;
 
@@ -2172,6 +2189,16 @@ export async function main(ns) {
                 if (!d || d.oneshotDaemon) continue;
                 if (isDaemonEnabled(ns, key, state)) continue;
                 stop(ns, key, "Schalter aus");
+            }
+
+            // ---------- 4c2. CORP OHNE CORP -> BEENDEN (v7.17) ---------------------
+            // shouldRun startet CORP nur noch, wenn eine Corp besteht. Ein schon
+            // LAUFENDES CORP ohne Corp bliebe aber stehen: der Uebergang von v7.16
+            // (im Testspiel am 28.09. genau so gesehen) oder ein von Hand
+            // gestartetes. Nur bei SICHEREM Nein (false, nicht null - direkt nach
+            // dem Laden sind die Ports leer) und nie gegen ein forciertes CORP (2).
+            if (S.pids.CORP && state.CORP !== 2 && corpBesteht(ns) === false) {
+                stop(ns, "CORP", "keine Corp");
             }
 
             // ---------- 4b. Veraltete Nutzlast? Dann beenden ---------------------
