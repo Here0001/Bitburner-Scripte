@@ -1,5 +1,25 @@
 /**
- * SCHWARM-BANK.js — v5.17
+ * SCHWARM-BANK.js — v5.18
+ *
+ * v5.18 — DIE CORP IN SCHWACHEN NODES (Punkt 24, Entscheidung des Spielers).
+ *   a) corpPossible(): unter Softcap 0,75 gruenden, sobald die $150b in
+ *      hoechstens CORP_SCHNELL_SEK (60 s) hereinkommen (incomeRate, Median).
+ *      "Multiplikatoren unbekannt" heisst jetzt null = nicht gruenden (vorher
+ *      true: nach jedem Neuladen einige Sekunden lang eine offene Tuer).
+ *      corpErledigt() wartet bei null, statt die Stufe abzuhaken.
+ *   b) START:CORP nur noch beim UEBERGANG "keine Corp -> Corp", nicht bei
+ *      jedem eigenen Start. Vorher galt ein Schalter 0 nach jedem Laden und
+ *      jedem Deploy rund eine Minute lang nicht (so entstand Chemical).
+ *   c) Hash-Nachfuellung der Corp-Fonds hoechstens EINMAL je CORP-Meldung
+ *      (vorher je Takt: $0,4b -> $183b bei einer Schwelle von $40b).
+ *   d) Rueckkauf und Verkauf von Corp-Aktien nur auf frischem CORP_OUT
+ *      (<= 120 s). Ohne laufendes CORP stand dort ein eingefrorener Kurs.
+ *   e) Ins Handlungsbuch: Corp-Gruendung, Rueckkauf (topf corporation),
+ *      Aktienverkauf (erloes) und der Hash-Zufluss in die Corp-Fonds.
+ *   Nachtrag 1 (Gegenpruefung, 26 Agenten): 60-s-Regel erst mit vollem
+ *   Einkommens-Puffer; Gruendung/Rueckkauf ohne RPC-Antwort = "unklar";
+ *   gemessener Rueckkaufbetrag gilt als Schaetzung; Rangliste und
+ *   Verkaufskapazitaet nur auf frischem CORP_OUT.
  *
  * v5.17 — MEHRERE FREIGABEN JE TAKT, UND JEDER KAUF MIT BETRAG IM BUCH.
  *   a) Geld-Antraege werden der Reihe nach bedient (prio absteigend, bei
@@ -866,7 +886,7 @@
 // 04.09.2026 waren das getrennte Freitexte und liefen auseinander: der
 // Kopf sagte eine Version, die Startmeldung im Log eine andere. Beim
 // Nachstellen eines Fehlers behauptet das Log damit etwas Falsches.
-const VERSION = "5.17";
+const VERSION = "5.18";
 
 import {
     drainBankInbox, hasCapability, CAPS, formatNumber, formatMoney,
@@ -1220,21 +1240,39 @@ export async function main(ns) {
     // bleibt (1e9^0.75 = $5.6m).
     //
     // WAS DAS NICHT SAGT: dass eine Corp dort sinnlos waere. Sie ist dort nur
-    // kein Weg zu Bargeld. Wer sie aus anderen Gruenden will, schaltet CORP
-    // von Hand ein — dieser Riegel haelt ausschliesslich die AUTOMATISCHE
-    // Gruendung auf BANKs Kosten an.
+    // kein Weg zu Bargeld.
+    //
+    // v5.18 (Entscheidung des Spielers, 26.09.2026): auch dort gruenden,
+    // sobald es praktisch nichts kostet - wenn die $150b in hoechstens
+    // CORP_SCHNELL_SEK hereinkommen. Eine BESTEHENDE Corp wird ohnehin
+    // gesteuert (HELPERS v5.17 daemonBereit), auch eine von Hand gegruendete.
     //
     // NEBENWIRKUNG, GEWOLLT: corpErledigt() haengt an corpPossible(). Wo die
     // Gruendung sich nicht lohnt, gilt die Corp-Stufe als abgehakt und die
     // Congruity-/Craft-Phase (v4.7/v4.8) laeuft an, statt ewig zu warten.
     const CORP_SOFTCAP_LOHNT = 0.75;
+    const CORP_SCHNELL_SEK   = 60;     // v5.18: schwache Node -> gruenden, wenn $150b in 60 s kommen
+    /** true = gruenden, false = nicht (sicher), null = unbekannt (nicht gruenden, nicht abhaken). */
     const corpPossible = () => {
         if (!bitNodeFeatures(ns).corporation) return false;
         const m = bnMults();
-        if (!m || typeof m.CorporationSoftcap !== "number") return true;   // unbekannt -> nicht sperren
+        // v5.18: unbekannt heisst NICHT erlaubt. Nach jedem Neuladen fehlt der
+        // bn-Block einige Sekunden (Ports leer, INFO noch nicht da) - mit true
+        // haette BANK dann in BN13/BN15 gegruendet.
+        if (!m || typeof m.CorporationSoftcap !== "number") return null;
         if (m.CorporationSoftcap < CORP_SOFTCAP_MIN) return false;         // Engine sperrt hart
-        return m.CorporationSoftcap >= CORP_SOFTCAP_LOHNT;                 // v5.3: lohnt es sich auch?
+        if (m.CorporationSoftcap >= CORP_SOFTCAP_LOHNT) return true;       // v5.3: lohnt sich
+        // v5.18: schwache Node - nur, wenn die Gruendung praktisch nichts kostet.
+        // Nachtrag 1: erst mit VOLLEM Median-Puffer (INCOME_SAMPLES, ~70 s).
+        // Bei ein oder zwei Messungen ist der "Median" das Maximum - ein
+        // einzelner Aktienverkauf haette sonst $150b ausgeloest.
+        const rate = incomeRate();
+        if (rank.incBuf.length < INCOME_SAMPLES) return null;
+        return rate * CORP_SCHNELL_SEK >= CORP_FOUNDING_COST;
     };
+    /** v5.18: CORP_OUT ist nur frisch, solange CORP laeuft (Runde ~35 s). */
+    const CORP_OUT_FRISCH_MS = 120_000;
+    const corpFrisch = (c) => !!(c && c.ts && (Date.now() - c.ts) <= CORP_OUT_FRISCH_MS);
     // =====================================================================
     // v5.4 — IN BN3 IST DIE GRUENDUNG UMSONST
     // =====================================================================
@@ -1272,7 +1310,8 @@ export async function main(ns) {
      * dieser BitNode unmoeglich ist. Der Geld-Vorrang bleibt ueberall dort
      * erhalten, wo es ihn ueberhaupt geben kann.
      */
-    const corpErledigt = () => corpExists || !corpPossible();
+    // v5.18: nur ein SICHERES Nein hakt ab. null (unbekannt) wartet.
+    const corpErledigt = () => corpExists || corpPossible() === false;
 
     /**
      * Erzeugt zusaetzlicher Worker-RAM in dieser BitNode ueberhaupt Geld?
@@ -1593,7 +1632,9 @@ export async function main(ns) {
         //    dieselbe Rechnung wie im Ziel — sonst steht in der Rangliste ein
         //    anderer Preis als der, der dann tatsaechlich abgebucht wird.
         const cc = io.corp;
-        if (cc && cc.public && (cc.issuedShares || 0) > 0 && (cc.sharePrice || 0) > 0) {
+        // Nachtrag 1: nur auf frischem CORP_OUT - sonst kann ein Posten zum
+        // eingefrorenen Kurs zum HOLD werden und Geld binden.
+        if (corpFrisch(cc) && cc.public && (cc.issuedShares || 0) > 0 && (cc.sharePrice || 0) > 0) {
             const total = cc.totalShares || 1;
             const rate = (cc.dividendRate || 0) > 0 ? cc.dividendRate : RUECKKAUF_PLAN_DIVIDENDE;
             const chunk = Math.floor(Math.min(cc.issuedShares, cc.buyback && cc.buyback.chunk ? cc.buyback.chunk : 10e6));
@@ -1924,6 +1965,9 @@ export async function main(ns) {
         //
         // RUECKFALL: meldet CORP kein Fenster (aeltere Version, Block fehlt),
         // bleibt der Rueckkauf aus. Lieber nicht kaufen als teuer kaufen.
+        // v5.18: nur auf frischem CORP_OUT - sonst kauft BANK zu einem
+        // eingefrorenen Kurs aus einem laengst geschlossenen Fenster.
+        if (!corpFrisch(cc)) return null;
         const fw = cc.fenster;
         if (!fw || fw.offen !== 1) return null;
 
@@ -1955,8 +1999,10 @@ export async function main(ns) {
             label: `Corp-Aktien: ${formatNumber(anzahl)} zurueck (${anteilJetzt.toFixed(1)}% -> ${(100 * (eigen + anzahl) / total).toFixed(1)}%)`,
             cost: kosten, ready: true,
             buy: async () => {
+                const geldVor = money();
                 const ok = await io.act("corpBuyback", [anzahl],   // v5.15: so heisst der Befehl in INFO
                     `(() => { try { ns.corporation.buyBackShares(${anzahl}); return true; } catch (e) { return false; } })()`);
+                rueckkaufBuchen(ok, anzahl, geldVor, kosten, "Ziel");
                 if (ok === true) {
                     ns.print(`[Corp] ${formatNumber(anzahl)} Aktien zurueckgekauft `
                         + `(${anteilJetzt.toFixed(2)}% -> ${(100 * (eigen + anzahl) / total).toFixed(2)}%, `
@@ -1980,6 +2026,17 @@ export async function main(ns) {
                 corpExists = true;
                 if (!corpStartSent) { sendCmd(ns, "START:CORP"); corpStartSent = true; }
             }
+            // v5.18: ins Handlungsbuch. Der Preis ist fest (Corporation/helpers.ts:80-85).
+            // Nachtrag 1: null = keine Antwort in 12 s - INFO kann den Auftrag
+            // spaeter noch ausfuehren. Wie home-RAM (v5.17): "unklar" mit Preis.
+            try {
+                const unklar = ok === null || ok === undefined;
+                chronik(ns, "BANK", "corp", CORP_NAME,
+                    ok === true ? "gegruendet" : (unklar ? "unklar" : "abgelehnt"),
+                    selbst ? formatMoney(CORP_FOUNDING_COST) : "Saatgeld",
+                    { betrag: (ok === true || unklar) && selbst ? CORP_FOUNDING_COST : 0,
+                      topf: "corporation", ...(unklar ? { unklar: true } : {}) });
+            } catch (e) { /* Beiwerk */ }
             return ok === true;
         },
     });
@@ -2219,15 +2276,24 @@ export async function main(ns) {
         if (io.b.corp) {
             const ex = io.b.corp.exists === true;
             if (ex && !corpExists) corpExists = true;
+            if (io.b.corp.exists === false) corpOhneGesehen = true;
         } else {
             const nowT = Date.now();
             if (!corpExists && nowT - corpCheckAt >= 30_000) {
                 corpCheckAt = nowT;
                 const r = await evalNs(ns, "ns.corporation.hasCorporation()");
                 corpExists = r === true;
+                if (r === false) corpOhneGesehen = true;
             }
         }
-        if (corpExists && !corpStartSent) { sendCmd(ns, "START:CORP"); corpStartSent = true; ns.print("Corp existiert -> START:CORP."); }
+        // v5.18: NUR beim Uebergang "keine Corp -> Corp" einschalten (etwa eine
+        // von Hand gegruendete). Stand die Corp schon beim Start dieses Prozesses,
+        // gilt der Schalter, wie er steht - vorher hebelte jedes Laden und jeder
+        // Deploy einen Schalter 0 fuer rund eine Minute aus.
+        if (corpExists && corpOhneGesehen && !corpStartSent) {
+            sendCmd(ns, "START:CORP"); corpStartSent = true;
+            ns.print("Neue Corp -> START:CORP.");
+        }
     };
 
     /** Großziel fahren: ansparen -> Lücke liquidieren -> kaufen -> ausbuchen. */
@@ -2443,6 +2509,7 @@ export async function main(ns) {
      *  Mehrheit (>= floorOwnFrac) zu unterschreiten? 0 bei Cooldown/keine Corp. */
     const corpSellCapacity = () => {
         const c = io.corp;
+        if (!corpFrisch(c)) return 0;                        // Nachtrag 1: nicht auf altem Kurs planen
         if (!c || !c.public || (c.sellCooldown || 0) > 0) return 0;
         const total = c.totalShares || 0, own = c.numShares || 0, price = c.sharePrice || 0;
         if (total <= 0 || price <= 0) return 0;
@@ -2451,9 +2518,32 @@ export async function main(ns) {
         // Verkauf drückt den Kurs -> konservativ mit Abschlag rechnen.
         return sellable * price / CORP_PRICE_PREMIUM;
     };
+    // v5.18: Rueckkauf ins Buch. Nachtrag 1 (Gegenpruefung): drei Ausgaenge
+    // wie beim home-RAM (v5.17). null = keine Antwort in 12 s, INFO fuehrt den
+    // Auftrag aber spaeter noch aus -> "unklar" mit der Schaetzung.
+    // Der gemessene Betrag gilt IMMER als Schaetzung: zwischen den beiden
+    // Geldstaenden liegt ein RPC, und in der Zeit fliessen Dividende (derselbe
+    // Topf!) und Einkommen. Liegt die Differenz ausserhalb von (0, 3x Formel],
+    // gilt die Formel.
+    const rueckkaufBuchen = (ok, anzahl, geldVor, schaetzung, wo) => {
+        const gekauft = ok === true, unklar = ok === null || ok === undefined;
+        const delta = geldVor - money();
+        const plausibel = gekauft && delta > 0 && (!(schaetzung > 0) || delta <= 3 * schaetzung);
+        const betrag = gekauft ? (plausibel ? delta : (schaetzung > 0 ? schaetzung : 0))
+                     : (unklar && schaetzung > 0 ? schaetzung : 0);
+        try {
+            chronik(ns, "BANK", "aktien", "Corp-Rueckkauf",
+                gekauft ? "gekauft" : (unklar ? "unklar" : "abgelehnt"),
+                `${formatNumber(anzahl)} Aktien, ${formatMoney(betrag)} (${wo})`,
+                { betrag, topf: "corporation", n: anzahl,
+                  ...(gekauft ? { geschaetzt: 1, quelle: plausibel ? "differenz" : "formel" } : {}),
+                  ...(unklar ? { unklar: true } : {}) });
+        } catch (e) { /* Beiwerk */ }
+    };
     /** Aktien für ~need $ verkaufen (bis Untergrenze). Gibt den Erlös (>0) zurück. */
     const corpSellForCash = async (need) => {
         const c = io.corp;
+        if (!corpFrisch(c)) return 0;                        // v5.18: kein Verkauf auf altem Kurs
         if (!c || !c.public || (c.sellCooldown || 0) > 0 || need <= 0) return 0;
         const total = c.totalShares || 0, own = c.numShares || 0, price = c.sharePrice || 0;
         if (total <= 0 || price <= 0) return 0;
@@ -2467,6 +2557,12 @@ export async function main(ns) {
         if (r === null || r === false) return 0;
         // sellShares liefert in dieser Engine keinen $-Wert -> Erlös schätzen.
         const est = want * price / CORP_PRICE_PREMIUM;
+        // v5.18: Zufluss, kein Kauf - daher erloes statt betrag.
+        try {
+            chronik(ns, "BANK", "aktien", "Corp-Verkauf", "verkauft",
+                `${formatNumber(want)} Aktien, ~${formatMoney(est)} fuer ein Grossziel`,
+                { erloes: est, topf: "corporation", n: want, geschaetzt: 1 });
+        } catch (e) { /* Beiwerk */ }
         ns.print(`CORP-AKTIEN: ${want} verkauft (~${formatMoney(est)}) für Großziel — Mehrheit bleibt (>= ${((c.floorOwnFrac || 2/3) * 100).toFixed(0)}%).`);
         return est;
     };
@@ -2477,6 +2573,7 @@ export async function main(ns) {
         if (now - lastCorpBuyback < CORP_BUYBACK_MS) return;
         lastCorpBuyback = now;
         const c = io.corp;
+        if (!corpFrisch(c)) return;                          // v5.18: nur auf frischem Stand
         if (!c || !c.public || !c.buyback || c.buyback.want !== 1) return;
         // v3.0: kein `if (goalState.active) return;` mehr. Diese Zeile war die im
         // v1.9-Kopf als "OFFEN BLEIBT" vermerkte zweite Sperre — sie verhinderte den
@@ -2503,8 +2600,10 @@ export async function main(ns) {
         const affordable = Math.floor(budget / (price * CORP_PRICE_PREMIUM));
         const count = Math.min(issued, chunk, affordable);
         if (count < 1) return;
+        const geldVor = money();
         const ok = await io.act("corpBuyback", [count],
             `(() => { try { ns.corporation.buyBackShares(${count}); return true; } catch (e) { return false; } })()`);   // v5.15: void -> true
+        rueckkaufBuchen(ok, count, geldVor, count * price * CORP_PRICE_PREMIUM, "Rendite");
         if (ok === true) ns.print(`CORP-AKTIEN: ${count} zurückgekauft (~${formatMoney(count * price)}), Rendite ${(divYieldPerH * 100).toFixed(0)}%/h >= Zins ${(gate * 100).toFixed(0)}%/h.`);
     };
 
@@ -3912,6 +4011,7 @@ export async function main(ns) {
     let lastGrantBlock = "";       // v4.1: warum der Top-Antrag nicht freigegeben wurde
     let corpExists   = false;
     let corpStartSent= false;      // START:CORP nur einmal senden
+    let corpOhneGesehen = false;   // v5.18: in DIESEM Prozess schon "keine Corp" gesehen?
     let grantedLast  = {};         // Freigabe-Schnappschuss vom letzten Tick (Verbrauchserkennung)
     let zurueckTakt  = new Set();  // v5.17 Nachtrag: ungenutzt zurueckgezogen (nicht buchen)
 
@@ -4052,6 +4152,7 @@ export async function main(ns) {
 
     // ===================== HAUPTSCHLEIFE =====================
     const needs = {};            // PRODUZENT -> { ts, fields }  (drainHashNeeds füllt)
+    let corpFondsTs = 0;         // v5.18: je CORP-Meldung hoechstens EINE Nachfuellung
     let U = null;                // aufgelöste Upgrade-Namen (Cache)
 
     ns.print(" // SCHWARM-BANK // v" + VERSION + " (INFRA gemergt)");
@@ -4260,9 +4361,14 @@ export async function main(ns) {
 
             // Corp-Fonds (nur wenn nötig und Kurs stimmt).
             const corp = fresh(needs, "CORP");
-            if (corp && U.corpFunds) {
+            // v5.18: die Meldung traegt den Fondsstand ihrer Runde. Wer je Takt
+            // (2 s) erneut nachfuellt, rechnet mit einem Stand, den er selbst
+            // laengst ueberholt hat - live $0,4b -> $183b bei Schwelle $40b.
+            const corpMeldung = needs["CORP"];
+            if (corp && U.corpFunds && corpMeldung && corpMeldung.ts !== corpFondsTs) {
                 const funds = Number(corp.funds);
                 if (isFinite(funds) && funds < CORP_FUNDS_MIN) {
+                    corpFondsTs = corpMeldung.ts;
                     const wanted = Math.ceil((CORP_FUNDS_MIN - funds) / 1e9);
                     let buys = 0;
                     while (buys < wanted) {
@@ -4271,7 +4377,15 @@ export async function main(ns) {
                         if (!spend(U.corpFunds)) break;
                         buys++;
                     }
-                    if (buys > 0) action.push(`Corp-Fonds: ${buys}x $1b`);
+                    if (buys > 0) {
+                        action.push(`Corp-Fonds: ${buys}x $1b`);
+                        // v5.18: kein Spielergeld, deshalb ohne topf/betrag.
+                        try {
+                            chronik(ns, "BANK", "hash", "Corp-Fonds", "gekauft",
+                                `${buys}x $1b (Fonds vorher ${formatMoney(funds)})`,
+                                { n: buys, fonds: buys * 1e9 });
+                        } catch (e) { /* Beiwerk */ }
+                    }
                 }
             }
 

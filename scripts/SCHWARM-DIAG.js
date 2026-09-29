@@ -1,5 +1,36 @@
 /**
- * SCHWARM-DIAG.js — v3.24
+ * SCHWARM-DIAG.js — v3.26
+ *
+ * v3.26 — CORP OHNE CORP IST KEIN MANGEL, UND "AUS, LAEUFT ABER" NUR, WENN
+ *   ES AM FENSTERENDE NOCH STIMMT. QUEEN v7.17 startet CORP erst, wenn eine
+ *   Corp besteht - "Schalter an, kein Prozess" ist dann der Sollzustand
+ *   ("wartet auf eine Corp"), nicht "FEHLT". Und im Testspiel z1832 wurde
+ *   der CORP-Schalter mitten im Fenster umgelegt; die Queen beendete den
+ *   Prozess 28 s spaeter, DIAG meldete trotzdem "Queen hat nicht
+ *   aufgeraeumt". Befund jetzt nur, wenn der Prozess in der LETZTEN Probe
+ *   noch lief.
+ *
+ * v3.25 — CORP-BEFUNDE NUR AUF FRISCHEN ZAHLEN, MIT DER RICHTIGEN BEGRUENDUNG.
+ *   (Punkt 24) Die Staedte-Regel zitierte das Reifetor von CORP v0.39
+ *   ("< 3"), meldete auch den normalen Ausbau der neuesten Division und
+ *   rechnete auf eingefrorenem CORP_OUT weiter (z1794: 2862 s alt, CORP aus,
+ *   Chemical hatte laengst 2 Staedte). Jetzt:
+ *   - Frische-Tor: CORP-Befunde nur, wenn CORP in den Proben lief UND
+ *     CORP_OUT hoechstens CORP_PORT_FRISCH_S alt ist. Sonst eine Zeile
+ *     "eingefroren" und keine Befunde.
+ *   - Staedte: Befund erst, wenn eine Division ueber CORP_STAEDTE_SERIE_MIN
+ *     Berichte bei laufendem CORP nicht waechst. Begruendung nach
+ *     ensureCities und dem Reifetor v0.40.
+ *   - Upgrades: verglichen wird mit dem, was corpUpgradeStep seit CORP v0.45
+ *     greifen kann (Fonds - Unlock - Betriebskapital), nicht mit dem Budget.
+ *   - Stillstand: der Zweig "Stufe ueber den Fonds" ist seit CORP v0.22
+ *     unerreichbar (Deckel 50 %) und entfaellt.
+ *   - Lager: nur fuer die Division, die dran ist (Reihum seit CORP v0.45).
+ *   - Node-Lage: in schwachen Nodes eine Zeile (kein Befund), was die Corp
+ *     dort bringt. "Corp(P31)" hiess der falsche Port - CORP_OUT ist 15.
+ *   Nachtrag 1: Staedte-Text nach dem echten Ablauf (ensureCities fuer JEDE
+ *   Division vor der Reihum-Wahl, eine einzelne kranke Stadt sperrt);
+ *   Reifegrad zeigt CORP ohne Corp in schwachen Nodes als "offen".
  *
  * v3.24 — KASSE. Neuer Abschnitt 4c, maschinenlesbar: Kassenbuch der
  *   Engine (getMoneySources), Geldstand, Reset-Stempel und ALLE Zeilen des
@@ -605,6 +636,7 @@ import {
     readShareWanted, readHashCacheNeed, readInfoSnapshot, getPhase,
     setDaemonEnabled, readOut, readAugBuy, readResetReady, planFreigabe,
     daemonBereit, bereitSpielerInfo,   // DAEMONS steht schon oben — nicht doppelt!
+    corpBesteht,                       // v3.26: CORP laeuft nur mit Corp (QUEEN v7.17)
     chronikLesen, CHRONIK_KUERZEL,     // v3.22: das Handlungsbuch
     chronikUmschichten,                // v3.24: Port 35 je Probe in die Datei
     BEREIT_GANG_KARMA, BEREIT_BLADE_STAT,
@@ -613,7 +645,7 @@ import {
 const OUT_FILE = "SCHWARM-REPORT.txt";
 const SHORT_FILE = "schwarm-kurz.txt";       // v2.2: Kurzfassung zum Weitergeben
 const LEGEND_FILE = "schwarm-legende.txt";   // v2.2: GENERIERT, nie von Hand pflegen
-const DIAG_VERSION = "3.24";   // EINE Quelle fuer Kopfzeile und Kurzreport-Format
+const DIAG_VERSION = "3.26";   // EINE Quelle fuer Kopfzeile und Kurzreport-Format
 // NACHGETRAGEN AM 11.09.: stand auf "3.4", waehrend der Dateikopf schon v3.5
 // sagte — dieselbe Falle, vor der oben (Zeile 95 und 368) bereits zweimal
 // gewarnt wird. Im Bericht vom 11.09. stand oben "SCHWARM-DIAGNOSE v3.4" und
@@ -717,6 +749,15 @@ const SELF_KEY = "DIAG";
 // ist richtig so — nach einem Neustart ist nichts beobachtet.
 const GANG_WARFARE_STREAK_MIN = 2;
 let gangWarfareStreak = 0;
+// v3.25: CORP_OUT gilt als frisch bis zu dieser Sekundenzahl. CORP
+// veroeffentlicht etwa alle 35 s (z1789: 19:35:03 / 19:35:38).
+const CORP_PORT_FRISCH_S = 120;
+// v3.25: so viele frische Berichte in Folge ohne neue Stadt, bevor es ein
+// Befund ist. CORP kauft je Runde hoechstens EINE Stadt je Division (vor der
+// Reihum-Wahl) und nur, wenn jede einzelne Stadt gesund ist - einzelne
+// Berichte ohne Zuwachs sind normal.
+const CORP_STAEDTE_SERIE_MIN = 3;
+const corpStaedteSerie = {};    // Division -> { staedte, n }
 // v3.4: Anlauf-Skripte. Keine Daemons — deshalb nicht in der Registry und
 // bisher unsichtbar. Siehe den BOOTSTRAP-Block in Abschnitt 2.
 const BOOT_FILES = { "SCHWARM-GENESIS.js": "GENESIS", "SCHWARM-ARSENAL.js": "ARSENAL" };
@@ -1903,7 +1944,12 @@ export async function main(ns) {
             // liefert in shouldRun einen unbedingten Treffer). "Schalter aus und
             // laeuft trotzdem" ist bei ihnen also der SOLLZUSTAND, kein Fehler.
             else if (!wanted && d.oneshotDaemon) verdict = e.n > 0 ? "One-Shot lief (Selbst-Aus)" : "aus (gewollt)";
-            else if (!wanted) verdict = e.n > 0 ? "!! AUS, läuft aber" : "aus (gewollt)";
+            // v3.26: nur ein Befund, wenn der Prozess am FENSTERENDE noch lief. Wird
+            // der Schalter mittendrin umgelegt, beendet die Queen den Daemon ein
+            // paar Sekunden spaeter - das ist aufgeraeumt, nicht vergessen.
+            else if (!wanted) verdict = e.n === 0 ? "aus (gewollt)"
+                : (e.last < nS - 1 ? `aus (im Fenster beendet, zuletzt Probe ${e.last + 1})`
+                                   : "!! AUS, läuft aber");
             else if (!capOk) verdict = `wartet: ${capNeed} fehlt`;
             else if (d.oneshotDaemon) verdict = e.n > 0 ? "One-Shot lief" : "One-Shot nicht im Fenster";
             else if (selfDriven) verdict = e.n > 0 ? "laeuft (Dispatcher-gefuehrt)" : "ruht — nichts offen";
@@ -1921,6 +1967,11 @@ export async function main(ns) {
             // dieser Form zuerst fragen, ob ein Daemon das mit Absicht tut.
             else if (key === "BITNODE" && e.n === 0 && !planFreigabe(ns)) {
                 verdict = "wartet auf Freigabe (schwarm-plan.txt)";
+            }
+            // v3.26 — CORP OHNE CORP (QUEEN v7.17): der Schalter ist die Absicht,
+            // gestartet wird erst, wenn eine Corp besteht. Sollzustand, kein Mangel.
+            else if (key === "CORP" && e.n === 0 && corpBesteht(ns) !== true) {
+                verdict = "wartet auf eine Corp (BANK gruendet)";
             }
             else if (e.n === 0) verdict = "!! FEHLT — nie gesehen";
             else if (frischGestartet) verdict = `frisch gestartet (ab Sample ${e.first + 1})`;
@@ -2661,13 +2712,37 @@ export async function main(ns) {
         // Und weil sie nicht mehr waechst, erreicht sie die Reserve nie. Genau
         // dieselbe Bauart wie die Sparziel-Sperre, die in BANK schon aufgefallen ist.
         const cq = last.corp;
-        if (!cq) {
-            L.push(`Corp(P31):      —`);
+        // v3.25: readCorpInfo liefert {} statt null - ohne ts gab es nie eine Meldung.
+        if (!cq || !cq.ts) {
+            L.push(`Corp(P15):      —`);
         } else {
             const alt = cq.ts ? Math.round((Date.now() - cq.ts) / 1000) : null;
-            L.push(`Corp(P31):      Fonds ${nMoney(cq.funds || 0)}   Profit ${nMoney(cq.profitPerSec || 0)}/s   `
+            // v3.25: FRISCHE-TOR. Befunde nur, wenn CORP lief und der Port frisch ist.
+            const corpLief = !!(seen["CORP"] && seen["CORP"].n > 0);
+            const corpFrisch = corpLief && alt !== null && alt <= CORP_PORT_FRISCH_S;
+            L.push(`Corp(P15):      Fonds ${nMoney(cq.funds || 0)}   Profit ${nMoney(cq.profitPerSec || 0)}/s   `
                 + `${cq.divisions || 0} Division(en), ${cq.cities || 0} Bueros (Division x Stadt, max 6 Staedte)`
                 + (alt === null ? "" : `   (${alt} s alt)`));
+            if (!corpFrisch) {
+                const um = new Date(cq.ts);
+                const hhmm = `${String(um.getHours()).padStart(2, "0")}:${String(um.getMinutes()).padStart(2, "0")}`;
+                L.push(`                (CORP ${corpLief ? "meldet nicht" : "lief in diesem Fenster nicht"} — `
+                    + `Stand von ${hhmm}, vor ${Math.round((alt || 0) / 60)} min. Die Zahlen sind eingefroren, `
+                    + `die CORP-Befunde ruhen.)`);
+            }
+            // v3.25: Node-Lage - was bringt die Corp in DIESER Node? Kein Befund.
+            try {
+                const bnC = last.inf && last.inf.blocks ? last.inf.blocks["bn"] : null;
+                const mC = bnC && bnC.data ? bnC.data.mults : null;
+                const sc = mC && typeof mC.CorporationSoftcap === "number" ? mC.CorporationSoftcap : null;
+                if (sc !== null && sc < 0.75) {
+                    const expo = Math.max(0, sc - 0.15);
+                    L.push(`                Node-Lage: CorporationSoftcap ${sc.toFixed(2)} — die Dividende wird `
+                        + `hoch ${expo.toFixed(2)} genommen (mit beiden Unlocks hoch ${sc.toFixed(2)}), die Corp bringt `
+                        + `hier kaum Geld. Gesteuert wird sie trotzdem (Spieler 26.09.), gegruendet nur, `
+                        + `wenn $150b in 60 s hereinkommen (BANK v5.18).`);
+                }
+            } catch (e) { /* nur Anzeige */ }
             const rp = cq.reserveParts || null;
             // v2.9: cq.budget ist der REST nach allen Kaeufen, nicht das Budget.
             // Wer beides verwechselt, haelt eine Corp, die ihr Geld vollstaendig
@@ -2726,7 +2801,10 @@ export async function main(ns) {
                 // corpUpgradeStep laeuft als LETZTER und sieht ohnehin nur den
                 // Rest nach Lager, Buero, Boost und AdVert. Dieselbe Krankheit
                 // wie beim Lager (CORP v0.43) und beim Buero (v0.39).
-                const unerreichbar = Object.keys(ups).filter(n => {
+                // v3.25: seit CORP v0.45 greift corpUpgradeStep Rundenrest UND
+                // Grossposten-Topf - zusammen Fonds - Unlock - Betriebskapital.
+                const greifbar = (cq.funds || 0) - (rp ? (rp.unlock || 0) + (rp.workCap || 0) : 0);
+                const unerreichbar = !corpFrisch ? [] : Object.keys(ups).filter(n => {
                     const u = ups[n] || {};
                     // v3.21: OHNE die Einschraenkung auf Stufe 0. Die stand hier
                     // zuerst und ging am Ziel vorbei - die erste Messung zeigte
@@ -2734,17 +2812,16 @@ export async function main(ns) {
                     // $1,27 Bio. Budget. Unerreichbar ist unerreichbar, egal auf
                     // welcher Stufe.
                     return typeof u.cost === "number" && u.cost > 0
-                        && bud > 0 && u.cost > bud;
+                        && greifbar > 0 && u.cost > greifbar;
                 });
                 if (unerreichbar.length) {
                     findings.push(`CORP: bei ${unerreichbar.length} Upgrade(s) kostet die `
-                        + `NAECHSTE Stufe mehr als das ganze Rundenbudget (${nMoney(bud)}): `
+                        + `NAECHSTE Stufe mehr als alles, was corpUpgradeStep ueberhaupt greifen kann `
+                        + `(Rundenrest plus Grossposten-Topf = Fonds minus Unlock-Reserve minus `
+                        + `Betriebskapital, ${nMoney(greifbar)}): `
                         + unerreichbar.map(n => `${n} Stufe ${ups[n].lvl} -> ${nMoney(ups[n].cost)}`).join(", ")
-                        + `. corpUpgradeStep ist der LETZTE Posten des Budgets und sieht nur `
-                        + `den Rest nach Lager, Buero, Boost und AdVert — diese Stufen sind `
-                        + `also nicht teuer, sondern unerreichbar. Gleiche Bauart wie der `
-                        + `Lager-Fehler (CORP v0.43) und der Buero-Fehler (v0.39): dort half `
-                        + `ein eigener Spartopf.`);
+                        + `. Einen eigenen Topf haben die Upgrades seit CORP v0.45 schon; diese `
+                        + `Stufen kommen erst, wenn die Fonds wachsen.`);
                 }
             }
 
@@ -2784,15 +2861,48 @@ export async function main(ns) {
                         + "  " + (d.ta2 ? "TA.II" : "MP")
                         + (d.produkte ? " +Produkte" : ""));
                 }
-                // BEFUNDE, die aus diesen Zahlen unmittelbar folgen.
-                for (const d of dl) {
-                    if ((d.staedte || 0) < maxSt) {
-                        findings.push(`CORP: Division "${d.d}" steht in ${d.staedte} von ${maxSt} Staedten. `
-                            + `Das Tor zur naechsten Blaupausen-Stufe oeffnet aber schon bei DREI Staedten `
-                            + `(SCHWARM-CORP prevCities.length < 3) — die Corp kann also auf eine zweite `
-                            + `Industrie sparen, bevor die erste fertig ausgebaut ist.`);
+                // BEFUNDE, die aus diesen Zahlen unmittelbar folgen - v3.25 nur
+                // auf frischen Zahlen (Frische-Tor oben).
+                const dranJetzt = typeof cq.dran === "string" ? cq.dran : null;
+                if (corpFrisch) {
+                    for (const k of Object.keys(corpStaedteSerie)) {
+                        if (!dl.some(x => x.d === k)) delete corpStaedteSerie[k];
                     }
-                    if ((d.wh || 0) > 0 && (d.whUsed || 0) / d.wh > 0.95) {
+                }
+                for (const d of dl) {
+                    if (!corpFrisch) break;
+                    // v3.25: STAEDTE. Eine Division unter 6 Staedten ist erst ein
+                    // Befund, wenn sie ueber mehrere frische Berichte nicht waechst.
+                    const st = d.staedte || 0;
+                    if (st < maxSt) {
+                        const s = corpStaedteSerie[d.d];
+                        corpStaedteSerie[d.d] = (s && s.staedte === st) ? { staedte: st, n: s.n + 1 } : { staedte: st, n: 1 };
+                        const n = corpStaedteSerie[d.d].n;
+                        if (n >= CORP_STAEDTE_SERIE_MIN) {
+                            const krank = (d.moral || 0) < 50 || (d.energie || 0) < 50;
+                            findings.push(`CORP: Division "${d.d}" steht seit ${n} Berichten unveraendert in `
+                                + `${st} von ${maxSt} Staedten, obwohl CORP laeuft. ensureCities kauft je Runde `
+                                + `hoechstens EINE Stadt je Division (Buero + Lager, $9 Mrd.), fuer jede Division noch `
+                                + `vor der Reihum-Wahl aus dem gemeinsamen Rundenbudget - und nur, wenn JEDE einzelne `
+                                + `bestehende Stadt Moral/Energie >= 50 und Personal hat. `
+                                + (krank ? `Moral/Energie stehen im Schnitt bei ${d.moral}/${d.energie}. `
+                                         : `Rundenbudget ${nMoney(bud)}; Moral/Energie im Schnitt ${d.moral}/${d.energie} - `
+                                           + `eine EINZELNE Stadt unter 50 sperrt trotzdem (CORP meldet nur den Schnitt; `
+                                           + `im CORP-Log steht dann "Staedte-Ausbau wartet"). `)
+                                + `Ist die Division Vorstufe einer noch ungebauten Blaupausen-Stufe, bleibt deren `
+                                + `Reifetor zu, solange Staedte fehlen (SCHWARM-CORP v0.40: prevCities.length < CITIES.length).`);
+                        }
+                    } else {
+                        delete corpStaedteSerie[d.d];
+                    }
+                    // v3.25: LAGER nur fuer die Division, die dran ist - die anderen
+                    // warten seit CORP v0.45 planmaessig auf ihre Runde.
+                    if (dranJetzt && dranJetzt !== d.d) {
+                        if ((d.wh || 0) > 0 && (d.whUsed || 0) / d.wh > 0.95) {
+                            L.push(`                "${d.d}": Lager ${Math.round(100 * d.whUsed / d.wh)} % — wartet auf ihre `
+                                + `Runde (dran: ${dranJetzt}, Reihum seit CORP v0.45).`);
+                        }
+                    } else if ((d.wh || 0) > 0 && (d.whUsed || 0) / d.wh > 0.95) {
                         findings.push(`CORP: Division "${d.d}" hat ihre Lager zu ${Math.round(100 * d.whUsed / d.wh)} % `
                             + `gefuellt (${fmtK(d.whUsed)}/${fmtK(d.wh)}). Ab 100 % stockt die Produktion — Lager vergroessern.`);
                     }
@@ -2805,13 +2915,15 @@ export async function main(ns) {
                 L.push("                (CORP < v0.37 meldet keine Kennzahlen je Division.)");
             }
             // DER BEFUND: Budget null trotz vorhandener Fonds heisst Stillstand.
-            if (bud <= 0 && (cq.funds || 0) > 0) {
-                const warum = rp && rp.stage > (cq.funds || 0)
-                    ? `Die naechste Blaupausen-Stufe allein (${nMoney(rp.stage)}) liegt ueber den Fonds `
-                      + `(${nMoney(cq.funds)}) — die Corp spart auf etwas, das sie ohne Wachstum nie erreicht.`
-                    : `Reserve ${nMoney(cq.reserve || 0)} >= Fonds ${nMoney(cq.funds || 0)}.`;
-                findings.push(`CORP steht still: Rundenbudget 0. ${warum} Solange das Budget 0 ist, `
-                    + `kauft CORP nichts — keine Lager, kein Personal, keine Upgrades, keine Boost-Materialien.`);
+            // v3.25: nur frisch. Der Zweig "Stufe ueber den Fonds" ist seit CORP
+            // v0.22 unerreichbar - die Stufen-Ruecklage ist auf 50 % gedeckelt.
+            if (corpFrisch && bud <= 0 && (cq.funds || 0) > 0) {
+                const teile = rp ? `Unlock-Reserve ${nMoney(rp.unlock || 0)} + Betriebskapital `
+                    + `${nMoney(rp.workCap || 0)}` : `Reserve ${nMoney(cq.reserve || 0)}`;
+                findings.push(`CORP steht still: Rundenbudget 0, weil ${teile} die Fonds `
+                    + `${nMoney(cq.funds)} aufzehren. Die Stufen-Ruecklage ist es nicht — sie ist seit CORP `
+                    + `v0.22 auf 50 % der freien Fonds gedeckelt. Damit ist auch der Grossposten-Topf leer: `
+                    + `kein Lager, kein Buero, keine Stadt, keine Upgrades, kein Boost.`);
             }
         }
         if (Array.isArray((last.bank || {}).blockiert)) {
@@ -3128,7 +3240,17 @@ export async function main(ns) {
                 let b;
                 try { b = daemonBereit(ns, key, sp); } catch (e) { continue; }
                 if (b === true) continue;                    // nur das Auffaellige zeigen
-                urteil.push(`${key} ${b === false ? "NEIN" : "unbekannt"}`);
+                // Nachtrag 1: CORP liefert in schwachen Nodes ohne Corp null, OBWOHL
+                // die Daten da sind - dort entscheidet BANK nach dem Einkommen.
+                let offen = false;
+                if (key === "CORP" && b === null) {
+                    try {
+                        const bnR = last.inf && last.inf.blocks ? last.inf.blocks["bn"] : null;
+                        const mR = bnR && bnR.data ? bnR.data.mults : null;
+                        offen = !!(mR && typeof mR.CorporationSoftcap === "number");
+                    } catch (e) { offen = false; }
+                }
+                urteil.push(`${key} ${b === false ? "NEIN" : (offen ? "offen (BANK gruendet nach Einkommen)" : "unbekannt")}`);
             }
             L.push(`  Reifegrad (daemonBereit): ${urteil.length ? urteil.join("  ·  ") : "alle bereit"}`);
             L.push("  Lesehilfe: NEIN = wird abgeschaltet und bleibt aus. unbekannt = Daten fehlen,");

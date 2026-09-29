@@ -1,5 +1,22 @@
 /**
- * SCHWARM-HELPERS.js — v5.16
+ * SCHWARM-HELPERS.js — v5.18
+ *
+ * v5.18 — corpBesteht(): EINE Antwort auf "gibt es eine Corp?" fuer QUEEN,
+ *   DIAG und daemonBereit. Zwei Quellen, die schnellere zuerst: der INFO-
+ *   Block (nur alle 6 min erneuert) und BANKs eigene Meldung corpExists auf
+ *   BANK_OUT (jeden Takt). QUEEN v7.17 startet CORP nur noch, wenn eine
+ *   Corp besteht (Spieler 27.09.2026: "corp auf on kostet ram?").
+ *
+ * v5.17 — EINE BESTEHENDE CORP WIRD GESTEUERT (Entscheidung des Spielers,
+ *   26.09.2026). daemonBereit(CORP) fragte nur den Softcap (>= 0,75) - auch
+ *   dann, wenn schon eine Corp stand. In BN15 lag so eine Corp mit $157b
+ *   brach, und die Selbstverwaltung schaltete CORP jedes Mal wieder ab, wenn
+ *   BANK es mit START:CORP eingeschaltet hatte. Jetzt wie bei Gang und
+ *   Bladeburner: ZUERST der Bestand (INFO corp.exists), dann die Huerde.
+ *   Ohne Corp: Softcap < 0,15 -> false (Engine sperrt), >= 0,75 -> true,
+ *   dazwischen null - dort entscheidet BANK ueber die Gruendung (60-s-Regel),
+ *   und der Schalter bleibt, wie er ist.
+ *   Nachtrag 1: der Vertrag von null nennt jetzt beide Bedeutungen.
  *
  * v5.16 — DAS HANDLUNGSBUCH WIRD PRUEFBAR. chronik() nimmt ein siebtes
  *   Feld: JSON mit ms (Epochenzeit) und dem, was der Aufrufer mitgibt - vor
@@ -592,7 +609,7 @@
 // 04.09.2026 waren das getrennte Freitexte und liefen auseinander: der
 // Kopf sagte eine Version, die Startmeldung im Log eine andere. Beim
 // Nachstellen eines Fehlers behauptet das Log damit etwas Falsches.
-const VERSION = "5.16";
+const VERSION = "5.18";
 
 
 // =============================================================================
@@ -2567,6 +2584,9 @@ export function readLiquidationRequest(ns) {
 //   true   Bedingung erfuellt ODER es gibt fuer diesen Daemon keine.
 //   false  Bedingung NACHWEISLICH nicht erfuellt -> darf ausgeschaltet werden.
 //   null   es gibt eine Bedingung, aber die Daten fehlen -> NICHT ANFASSEN.
+//          v5.17: bei CORP ohne Corp in einer schwachen Node (Softcap
+//          0,15-0,75) auch: BANK entscheidet nach dem Einkommen. Ebenfalls
+//          nicht anfassen.
 // Raten waere hier eine Handlung, kein Zustand.
 //
 // DIE SPIELERWERTE KOMMEN VON AUSSEN, UND ZWAR AUS EINEM GUTEN GRUND.
@@ -2596,9 +2616,13 @@ export function readLiquidationRequest(ns) {
 //                Groessenordnung uebrig. Gleiche Schwelle wie BANK v5.3
 //                (CORP_SOFTCAP_LOHNT) — bewusst doppelt genannt, aber mit
 //                derselben Zahl und derselben Begruendung an beiden Stellen.
+//                v5.17: gilt nur fuer die GRUENDUNG. Eine bestehende Corp
+//                ist immer bereit (Spieler 26.09.2026); unter 0,75 gruendet
+//                BANK nur, wenn $150b in 60 s hereinkommen.
 export const BEREIT_GANG_KARMA = -54_000;  // Gang/data/Constants.ts:27
 export const BEREIT_BLADE_STAT = 100;      // Beitritt: alle vier Kampfwerte
 export const BEREIT_CORP_SOFTCAP = 0.75;   // = BANK CORP_SOFTCAP_LOHNT
+export const BEREIT_CORP_SOFTCAP_MIN = 0.15; // Corporation/helpers.ts:74 - darunter sperrt die Engine
 export const BEREIT_BLADE_AUG = "The Blade's Simulacrum";
 
 // v5.10 — EINMAL FREIGESCHALTET IST NICHT DASSELBE WIE "BEDINGUNG ERFUELLT".
@@ -2610,6 +2634,23 @@ export const BEREIT_BLADE_AUG = "The Blade's Simulacrum";
 //
 // Deshalb wird ZUERST der Mitgliedsstand gefragt und erst danach die Huerde.
 // Andersherum haette ein Aug-Install eine laufende Gang "unreif" gemacht.
+/**
+ * v5.18 — Besteht eine Corp? true = ja, false = INFO sagt nein (und BANK
+ * nicht ja), null = unbekannt. INFO erneuert den corp-Block nur alle 6 min;
+ * direkt nach einer Gruendung stuende dort noch "keine Corp". BANK meldet
+ * ihren Stand (corpExists) dagegen in jedem Takt. Eine Corp verschwindet
+ * innerhalb einer Node nie (nur beim BitNode-Wechsel, und dann sind alle
+ * Ports leer) - ein "ja" aus einer der beiden Quellen gilt also.
+ */
+export function corpBesteht(ns) {
+    let info = null;
+    try { info = readInfoBlock(ns, "corp", Infinity); } catch (e) { info = null; }
+    if (info && info.exists === true) return true;
+    try { const b = readBankInfo(ns); if (b && b.corpExists === true) return true; } catch (e) { /* weiter */ }
+    if (info && info.exists === false) return false;
+    return null;
+}
+
 /** Installierte Augmentierungen aus dem INFO-Block. null = nicht bekannt. */
 function bereitAugsInstalliert(ns) {
     try {
@@ -2680,10 +2721,18 @@ export function daemonBereit(ns, key, sp) {
         return true;
     }
     if (key === "CORP") {
+        // v5.17: ZUERST der Bestand. Wer eine Corp hat, laesst sie steuern -
+        // egal, ob BANK oder der Spieler gegruendet hat (Spieler 26.09.2026).
+        // v5.18: ueber corpBesteht (INFO ODER BANKs eigene Meldung).
+        try { if (corpBesteht(ns) === true) return true; } catch (e) { /* weiter zur Huerde */ }
         let m = null;
         try { const b = readInfoBlock(ns, "bn", Infinity); if (b) m = b.mults; } catch (e) { m = null; }
         if (!m || typeof m.CorporationSoftcap !== "number") return null;
-        return m.CorporationSoftcap >= BEREIT_CORP_SOFTCAP;
+        if (m.CorporationSoftcap < BEREIT_CORP_SOFTCAP_MIN) return false;   // Engine sperrt die Gruendung
+        if (m.CorporationSoftcap >= BEREIT_CORP_SOFTCAP) return true;
+        // Schwache Node ohne Corp: ob gegruendet wird, entscheidet BANK nach
+        // dem Einkommen (60-s-Regel). Bis dahin weder an- noch abschalten.
+        return null;
     }
     return true;                                          // keine Zusatzbedingung
 }
